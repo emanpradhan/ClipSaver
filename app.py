@@ -32,11 +32,11 @@ def env_int(name, default):
         return default
 
 
-MAX_ACTIVE = env_int("MAX_ACTIVE", 3)              # downloads running at once
-MAX_QUEUED = env_int("MAX_QUEUED", 6)              # extra jobs allowed to wait
+MAX_ACTIVE = env_int("MAX_ACTIVE", 1)              # downloads running at once
+MAX_QUEUED = env_int("MAX_QUEUED", 2)              # extra jobs allowed to wait
 MAX_PER_IP = env_int("MAX_PER_IP", 2)              # unfinished jobs per visitor
 MAX_DURATION = env_int("MAX_DURATION_SECONDS", 3 * 3600)
-MAX_FILESIZE = env_int("MAX_FILESIZE_MB", 2048) * 1024 * 1024
+MAX_FILESIZE = env_int("MAX_FILESIZE_MB", 300) * 1024 * 1024
 MIN_FREE_BYTES = env_int("MIN_FREE_MB", 1500) * 1024 * 1024
 CACHE_TTL = 600                                    # remember a looked-up video for 10 min
 READY_TTL = 600                                    # keep a finished file for 10 min
@@ -62,7 +62,31 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 POOL = ThreadPoolExecutor(max_workers=MAX_ACTIVE, thread_name_prefix="dl")
 INFO_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="info")
-INFO_TIMEOUT = env_int("INFO_TIMEOUT", 25)
+INFO_TIMEOUT = env_int("INFO_TIMEOUT", 45)
+
+# --------------------------------------------------------------------------- proxy / cookies
+PROXY = os.environ.get("YTDLP_PROXY")          # e.g. http://user:pass@host:port
+COOKIE_SRC = os.environ.get("COOKIE_FILE")     # e.g. /etc/secrets/cookies.txt
+COOKIE_PATH = None
+
+if COOKIE_SRC and os.path.exists(COOKIE_SRC):
+    # yt-dlp writes back to its cookie file, and Render secret files are read-only,
+    # so work on a copy made once at startup.
+    try:
+        COOKIE_PATH = os.path.join(tempfile.gettempdir(), "cookies.txt")
+        shutil.copy(COOKIE_SRC, COOKIE_PATH)
+    except OSError:
+        COOKIE_PATH = None
+
+
+def common_opts():
+    o = {"quiet": True, "no_warnings": True, "noplaylist": True,
+         "socket_timeout": 15, "extractor_retries": 2}
+    if PROXY:
+        o["proxy"] = PROXY
+    if COOKIE_PATH:
+        o["cookiefile"] = COOKIE_PATH
+    return o
 
 
 class Cancelled(Exception):
@@ -146,7 +170,8 @@ def friendly_error(e):
         (("private video",), "This video is private."),
         (("confirm your age", "age-restricted", "age restricted"), "Age-restricted videos can't be downloaded."),
         (("not a bot", "sign in to confirm"), "YouTube is asking this network to verify. Try again later."),
-        (("not available in your country", "geo", "blocked it in your country"), "This video isn't available in this region."),
+        (("not available in your country", "geo-restrict", "geo restrict", "blocked it in your country"),
+         "This video isn't available in this region."),
         (("is live", "live event", "premiere"), "Live streams and premieres can't be downloaded until they end."),
         (("video unavailable", "has been removed", "no longer available", "does not exist"), "This video is unavailable."),
         (("ffmpeg", "ffprobe"), "ffmpeg is missing on the server, so this format can't be created."),
@@ -174,12 +199,17 @@ def oembed(url):
 
 def build_opts(kind, height, abr, subtitles, template):
     base = {
-        "outtmpl": template, "noplaylist": True, "quiet": True, "no_warnings": True,
-        "windowsfilenames": True, "max_filesize": MAX_FILESIZE,
-        # speed: parallel fragments + chunked requests avoid YouTube throttling
-        "concurrent_fragment_downloads": 8, "http_chunk_size": 10 * 1024 * 1024,
-        "retries": 5, "fragment_retries": 5, "extractor_retries": 2, "socket_timeout": 20,
+        **common_opts(),
+        "outtmpl": template,
+        "windowsfilenames": True,
+        "max_filesize": MAX_FILESIZE,
+        "concurrent_fragment_downloads": 4,
+        "retries": 3,
+        "fragment_retries": 5,
+        "extractor_retries": 3,   # overrides 2 from common_opts
+        "socket_timeout": 40,     # overrides 15 from common_opts
     }
+
     if kind == "audio":
         base.update(
             format="bestaudio[ext=m4a]/bestaudio/best",
@@ -256,10 +286,14 @@ def run_job(jid):
             except Exception:
                 job["expected"] = 0
 
+            # yt-dlp silently skips files over max_filesize, so catch it here with a clear message.
+            if job["expected"] and job["expected"] > MAX_FILESIZE:
+                raise ValueError("That file is too large for this server. Pick a lower quality.")
+
             job["stage"] = "downloading"
             try:  # fast path: reuse info we already fetched
                 ydl.process_ie_result(fresh(meta), download=True)
-            except Cancelled: 
+            except Cancelled:
                 raise
             except Exception:
                 if job["cancel"]:
@@ -275,7 +309,7 @@ def run_job(jid):
 
         files = sorted(os.listdir(job["dir"]))
         if not files:
-            raise ValueError("No file was produced.")
+            raise ValueError("No file was produced. It may be too large for this server.")
         main = next((f for f in files if f.lower().endswith((".mp4", ".mp3"))), files[0])
         if len(files) > 1:  # video + subtitles
             zpath = os.path.join(job["dir"], os.path.splitext(main)[0] + ".zip")
@@ -330,8 +364,12 @@ def janitor():
 threading.Thread(target=janitor, daemon=True, name="janitor").start()
 if not shutil.which("ffmpeg"):
     log.warning("ffmpeg not found: MP3 and video merging will fail. Install it and add it to PATH.")
-if not (shutil.which("deno") or shutil.which("node") or shutil.which("bun")):
-    log.warning("No JavaScript runtime found. Install Deno for faster, complete YouTube support.")
+if not shutil.which("deno"):
+    log.warning("Deno not found. yt-dlp needs it to solve YouTube's JavaScript challenges.")
+if PROXY:
+    log.info("Using proxy for yt-dlp requests.")
+if COOKIE_SRC and not COOKIE_PATH:
+    log.warning("COOKIE_FILE is set but the file could not be read: %s", COOKIE_SRC)
 
 
 # --------------------------------------------------------------------------- http
@@ -373,9 +411,15 @@ def index():
 
 @app.route("/health")
 def health():
-    return jsonify(ok=True, yt_dlp_version=getattr(yt_dlp, "version", None) and yt_dlp.version.__version__, ffmpeg=bool(shutil.which("ffmpeg")),
-                   js_runtime=bool(shutil.which("deno") or shutil.which("node") or shutil.which("bun")),
-                   active=sum(1 for j in JOBS.values() if j["status"] in ACTIVE_STATES))
+    with JOBS_LOCK:
+        active = sum(1 for j in JOBS.values() if j["status"] in ACTIVE_STATES)
+    return jsonify(ok=True,
+                   yt_dlp_version=yt_dlp.version.__version__,
+                   ffmpeg=bool(shutil.which("ffmpeg")),
+                   js_runtime=bool(shutil.which("deno")),
+                   proxy=bool(PROXY),
+                   cookies=bool(COOKIE_PATH),
+                   active=active)
 
 
 @app.route("/api/preview", methods=["POST"])
@@ -397,8 +441,7 @@ def preview():
 
 
 def fetch_info(url):
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
-            "socket_timeout": 15, "extractor_retries": 2}
+    opts = {**common_opts(), "skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -418,7 +461,7 @@ def info():
             cache_put(url, data)
         except FuturesTimeout:
             log.warning("info timed out after %ss for %s", INFO_TIMEOUT, url)
-            return jsonify(error="YouTube is responding too slowly. Update yt-dlp, install Deno, then retry."), 504
+            return jsonify(error="YouTube is responding too slowly. Please try again in a moment."), 504
         except Exception as e:
             log.warning("info failed for %s: %s", url, e)
             detail = (str(e).replace("ERROR: ", "").splitlines() or [""])[0][:140]
